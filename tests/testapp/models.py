@@ -84,6 +84,9 @@ class BlogPost(models.Model):
     """
     state = FSMField(default='new', protected=True)
 
+    def can_restore(self, user):
+        return user.is_superuser or user.is_staff
+
     @transition(field=state, source='new', target='published',
                 on_error='failed', permission='testapp.can_publish_post')
     def publish(self):
@@ -97,10 +100,19 @@ class BlogPost(models.Model):
     def hide(self):
         pass
 
-    @transition(field=state, source='new', target='removed',
-                on_error='failed', permission=lambda u: u.has_perm('testapp.can_remove_post'))
+    @transition(
+        field=state,
+        source='new',
+        target='removed',
+        on_error='failed',
+        permission=lambda self, u: u.has_perm('testapp.can_remove_post'))
     def remove(self):
         raise Exception('No rights to delete %s' % self)
+
+    @transition(field=state, source='new', target='restored',
+                on_error='failed', permission=can_restore)
+    def restore(self):
+        pass
 
     @transition(field=state, source=['published', 'hidden'], target='stolen')
     def steal(self):

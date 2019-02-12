@@ -32,12 +32,20 @@ class BlogPost(models.Model):
     def moderate(self):
         pass
 
+    @transition(source='+', target='blocked', field=state)
+    def block(self):
+        pass
+
+    @transition(source='*', target='', field=state)
+    def empty(self):
+        pass
+
 
 class FSMFieldTest(TestCase):
     def setUp(self):
         self.model = BlogPost()
 
-    def test_initial_state_instatiated(self):
+    def test_initial_state_instantiated(self):
         self.assertEqual(self.model.state, 'new')
 
     def test_known_transition_should_succeed(self):
@@ -49,7 +57,7 @@ class FSMFieldTest(TestCase):
         self.model.hide()
         self.assertEqual(self.model.state, 'hidden')
 
-    def test_unknow_transition_fails(self):
+    def test_unknown_transition_fails(self):
         self.assertFalse(can_proceed(self.model.hide))
         self.assertRaises(TransitionNotAllowed, self.model.hide)
 
@@ -63,16 +71,16 @@ class FSMFieldTest(TestCase):
         self.model.notify_all()
         self.assertEqual(self.model.state, 'published')
 
-    def test_unknow_null_transition_should_fail(self):
+    def test_unknown_null_transition_should_fail(self):
         self.assertRaises(TransitionNotAllowed, self.model.notify_all)
         self.assertEqual(self.model.state, 'new')
 
-    def test_mutiple_source_support_path_1_works(self):
+    def test_multiple_source_support_path_1_works(self):
         self.model.publish()
         self.model.steal()
         self.assertEqual(self.model.state, 'stolen')
 
-    def test_mutiple_source_support_path_2_works(self):
+    def test_multiple_source_support_path_2_works(self):
         self.model.publish()
         self.model.hide()
         self.model.steal()
@@ -82,6 +90,26 @@ class FSMFieldTest(TestCase):
         self.assertTrue(can_proceed(self.model.moderate))
         self.model.moderate()
         self.assertEqual(self.model.state, 'moderated')
+
+    def test_plus_shortcut_succeeds_for_other_source(self):
+        """Tests that the '+' shortcut succeeds for a source
+        other than the target.
+        """
+        self.assertTrue(can_proceed(self.model.block))
+        self.model.block()
+        self.assertEqual(self.model.state, 'blocked')
+
+    def test_plus_shortcut_fails_for_same_source(self):
+        """Tests that the '+' shortcut fails if the source
+        equals the target.
+        """
+        self.model.block()
+        self.assertFalse(can_proceed(self.model.block))
+        self.assertRaises(TransitionNotAllowed, self.model.block)
+
+    def test_empty_string_target(self):
+        self.model.empty()
+        self.assertEqual(self.model.state, '')
 
 
 class StateSignalsTests(TestCase):
@@ -115,8 +143,68 @@ class TestFieldTransitionsInspect(TestCase):
     def setUp(self):
         self.model = BlogPost()
 
-    def test_available_conditions(self):
-        pass
+    def test_available_conditions_from_new(self):
+        transitions = self.model.get_available_state_transitions()
+        actual = set((transition.source, transition.target) for transition in transitions)
+        expected = set([('*', 'moderated'),
+                        ('new', 'published'),
+                        ('new', 'removed'),
+                        ('*', ''),
+                        ('+', 'blocked')])
+        self.assertEqual(actual, expected)
+
+    def test_available_conditions_from_published(self):
+        self.model.publish()
+        transitions = self.model.get_available_state_transitions()
+        actual = set((transition.source, transition.target) for transition in transitions)
+        expected = set([('*', 'moderated'),
+                        ('published', None),
+                        ('published', 'hidden'),
+                        ('published', 'stolen'),
+                        ('*', ''),
+                        ('+', 'blocked')])
+        self.assertEqual(actual, expected)
+
+    def test_available_conditions_from_hidden(self):
+        self.model.publish()
+        self.model.hide()
+        transitions = self.model.get_available_state_transitions()
+        actual = set((transition.source, transition.target) for transition in transitions)
+        expected = set([('*', 'moderated'),
+                        ('hidden', 'stolen'),
+                        ('*', ''),
+                        ('+', 'blocked')])
+        self.assertEqual(actual, expected)
+
+    def test_available_conditions_from_stolen(self):
+        self.model.publish()
+        self.model.steal()
+        transitions = self.model.get_available_state_transitions()
+        actual = set((transition.source, transition.target) for transition in transitions)
+        expected = set([('*', 'moderated'),
+                        ('*', ''),
+                        ('+', 'blocked')])
+        self.assertEqual(actual, expected)
+
+    
+    def test_available_conditions_from_blocked(self):
+        self.model.block()
+        transitions = self.model.get_available_state_transitions()
+        actual = set((transition.source, transition.target) for transition in transitions)
+        expected = set([('*', 'moderated'),
+                        ('*', '')])
+        self.assertEqual(actual, expected)
+        
+
+    def test_available_conditions_from_empty(self):
+        self.model.empty()
+        transitions = self.model.get_available_state_transitions()
+        actual = set((transition.source, transition.target) for transition in transitions)
+        expected = set([('*', 'moderated'),
+                        ('*', ''),
+                        ('+', 'blocked')])
+        self.assertEqual(actual, expected)
+        
 
     def test_all_conditions(self):
         transitions = self.model.get_all_state_transitions()
@@ -128,5 +216,7 @@ class TestFieldTransitionsInspect(TestCase):
                         ('published', None),
                         ('published', 'hidden'),
                         ('published', 'stolen'),
-                        ('hidden', 'stolen')])
+                        ('hidden', 'stolen'),
+                        ('*', ''),
+                        ('+', 'blocked')])
         self.assertEqual(actual, expected)

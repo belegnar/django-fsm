@@ -3,14 +3,22 @@
 State tracking functionality for django models
 """
 import inspect
-from functools import wraps
 import sys
+from functools import wraps
 
 from django.db import models
-from django.db.models.loading import get_model
 from django.db.models.signals import class_prepared
 from django.utils.functional import curry
 from django_fsm.signals import pre_transition, post_transition
+
+try:
+    from django.apps import apps as django_apps
+
+    def get_model(app_label, model_name):
+        app = django_apps.get_app_config(app_label)
+        return app.get_model(model_name)
+except ImportError:
+    from django.db.models.loading import get_model
 
 
 __all__ = ['TransitionNotAllowed', 'ConcurrentTransition',
@@ -50,6 +58,15 @@ else:
 class TransitionNotAllowed(Exception):
     """Raised when a transition is not allowed"""
 
+    def __init__(self, *args, **kwargs):
+        self.object = kwargs.pop('object', None)
+        self.method = kwargs.pop('method', None)
+        super(TransitionNotAllowed, self).__init__(*args, **kwargs)
+
+
+class InvalidResultState(Exception):
+    """Raised when we got invalid result state"""
+
 
 class ConcurrentTransition(Exception):
     """
@@ -73,10 +90,12 @@ class Transition(object):
     def name(self):
         return self.method.__name__
 
-    def has_perm(self, user):
+    def has_perm(self, instance, user):
         if not self.permission:
             return True
-        elif callable(self.permission) and self.permission(user):
+        elif callable(self.permission):
+            return bool(self.permission(instance, user))
+        elif user.has_perm(self.permission, instance):
             return True
         elif user.has_perm(self.permission):
             return True
@@ -94,12 +113,8 @@ def get_available_FIELD_transitions(instance, field):
 
     for name, transition in transitions.items():
         meta = transition._django_fsm
-
-        for state in [curr_state, '*']:
-            if state in meta.transitions:
-                transition = meta.transitions[state]
-                if all(map(lambda condition: condition(instance), transition.conditions)):
-                    yield transition
+        if meta.has_transition(curr_state) and meta.conditions_met(instance, curr_state):
+            yield meta.get_transition(curr_state)
 
 
 def get_all_FIELD_transitions(instance, field):
@@ -115,7 +130,7 @@ def get_available_user_FIELD_transitions(instance, user, field):
     with all conditions met and user have rights on it
     """
     for transition in get_available_FIELD_transitions(instance, field):
-        if transition.has_perm(user):
+        if transition.has_perm(instance, user):
             yield transition
 
 
@@ -131,6 +146,8 @@ class FSMMeta(object):
         transition = self.transitions.get(source, None)
         if transition is None:
             transition = self.transitions.get('*', None)
+        if transition is None:
+            transition = self.transitions.get('+', None)
         return transition
 
     def add_transition(self, method, source, target, on_error=None, conditions=[], permission=None, custom={}):
@@ -150,7 +167,16 @@ class FSMMeta(object):
         """
         Lookup if any transition exists from current model state using current method
         """
-        return state in self.transitions or '*' in self.transitions
+        if state in self.transitions:
+            return True
+
+        if '*' in self.transitions:
+            return True
+
+        if '+' in self.transitions and self.transitions['+'].target != state:
+            return True
+
+        return False
 
     def conditions_met(self, instance, state):
         """
@@ -171,7 +197,7 @@ class FSMMeta(object):
         if not transition:
             return False
         else:
-            return transition.has_perm(user)
+            return transition.has_perm(instance, user)
 
     def next_state(self, current_state):
         transition = self.get_transition(current_state)
@@ -196,7 +222,7 @@ class FSMFieldDescriptor(object):
 
     def __get__(self, instance, type=None):
         if instance is None:
-            raise AttributeError('Can only be accessed via an instance.')
+            return self
         return self.field.get_state(instance)
 
     def __set__(self, instance, value):
@@ -219,7 +245,7 @@ class FSMFieldMixin(object):
         state_choices = kwargs.pop('state_choices', None)
         choices = kwargs.get('choices', None)
         if state_choices is not None and choices is not None:
-            raise ValueError('Use one of choices or state_choces value')
+            raise ValueError('Use one of choices or state_choices value')
 
         if state_choices is not None:
             choices = []
@@ -269,10 +295,12 @@ class FSMFieldMixin(object):
 
         if not meta.has_transition(current_state):
             raise TransitionNotAllowed(
-                "Can't switch from state '{0}' using method '{1}'".format(current_state, method_name))
+                "Can't switch from state '{0}' using method '{1}'".format(current_state, method_name),
+                object=instance, method=method)
         if not meta.conditions_met(instance, current_state):
             raise TransitionNotAllowed(
-                "Transition conditions have not been met for method '{0}'".format(method_name))
+                "Transition conditions have not been met for method '{0}'".format(method_name),
+                object=instance, method=method)
 
         next_state = meta.next_state(current_state)
 
@@ -280,15 +308,23 @@ class FSMFieldMixin(object):
             'sender': instance.__class__,
             'instance': instance,
             'name': method_name,
+            'field': meta.field,
             'source': current_state,
-            'target': next_state
+            'target': next_state,
+            'method_args' : args,
+            'method_kwargs' : kwargs
         }
 
         pre_transition.send(**signal_kwargs)
 
         try:
             result = method(instance, *args, **kwargs)
-            if next_state:
+            if next_state is not None:
+                if hasattr(next_state, 'get_state'):
+                    next_state = next_state.get_state(
+                        instance, transition, result,
+                        args=args, kwargs=kwargs)
+                    signal_kwargs['target'] = next_state
                 self.set_proxy(instance, next_state)
                 self.set_state(instance, next_state)
         except Exception as exc:
@@ -317,10 +353,10 @@ class FSMFieldMixin(object):
             for transition in meta.transitions.values():
                 yield transition
 
-    def contribute_to_class(self, cls, name, virtual_only=False):
+    def contribute_to_class(self, cls, name, **kwargs):
         self.base_cls = cls
 
-        super(FSMFieldMixin, self).contribute_to_class(cls, name, virtual_only=virtual_only)
+        super(FSMFieldMixin, self).contribute_to_class(cls, name, **kwargs)
         setattr(cls, self.name, self.descriptor_class(self))
         setattr(cls, 'get_all_{0}_transitions'.format(self.name),
                 curry(get_all_FIELD_transitions, field=self))
@@ -462,22 +498,26 @@ def transition(field, source='*', target=None, on_error=None, conditions=[], per
     has not changed after the function call
     """
     def inner_transition(func):
-        fsm_meta = getattr(func, '_django_fsm', None)
+        wrapper_installed, fsm_meta = True, getattr(func, '_django_fsm', None)
         if not fsm_meta:
+            wrapper_installed = False
             fsm_meta = FSMMeta(field=field, method=func)
             setattr(func, '_django_fsm', fsm_meta)
 
-        @wraps(func)
-        def _change_state(instance, *args, **kwargs):
-            return fsm_meta.field.change_state(instance, func, *args, **kwargs)
-
-        if isinstance(source, (list, tuple)):
+        if isinstance(source, (list, tuple, set)):
             for state in source:
                 func._django_fsm.add_transition(func, state, target, on_error, conditions, permission, custom)
         else:
             func._django_fsm.add_transition(func, source, target, on_error, conditions, permission, custom)
 
-        return _change_state
+        @wraps(func)
+        def _change_state(instance, *args, **kwargs):
+            return fsm_meta.field.change_state(instance, func, *args, **kwargs)
+
+        if not wrapper_installed:
+            return _change_state
+
+        return func
 
     return inner_transition
 
@@ -490,7 +530,8 @@ def can_proceed(bound_method, check_conditions=True):
     conditions.
     """
     if not hasattr(bound_method, '_django_fsm'):
-        raise TypeError('%s method is not transition' % bound_method.im_func.__name__)
+        im_func = getattr(bound_method, 'im_func', getattr(bound_method, '__func__'))
+        raise TypeError('%s method is not transition' % im_func.__name__)
 
     meta = bound_method._django_fsm
     im_self = getattr(bound_method, 'im_self', getattr(bound_method, '__self__'))
@@ -505,12 +546,46 @@ def has_transition_perm(bound_method, user):
     Returns True if model in state allows to call bound_method and user have rights on it
     """
     if not hasattr(bound_method, '_django_fsm'):
-        raise TypeError('%s method is not transition' % bound_method.im_func.__name__)
+        im_func = getattr(bound_method, 'im_func', getattr(bound_method, '__func__'))
+        raise TypeError('%s method is not transition' % im_func.__name__)
 
     meta = bound_method._django_fsm
     im_self = getattr(bound_method, 'im_self', getattr(bound_method, '__self__'))
     current_state = meta.field.get_state(im_self)
 
-    return (meta.has_transition(current_state)
-            and meta.conditions_met(im_self, current_state)
-            and meta.has_transition_perm(im_self, current_state, user))
+    return (meta.has_transition(current_state) and
+            meta.conditions_met(im_self, current_state) and
+            meta.has_transition_perm(im_self, current_state, user))
+
+
+class State(object):
+    def get_state(self, model, transition, result, args=[], kwargs={}):
+        raise NotImplementedError
+
+
+class RETURN_VALUE(State):
+    def __init__(self, *allowed_states):
+        self.allowed_states = allowed_states if allowed_states else None
+
+    def get_state(self, model, transition, result, args=[], kwargs={}):
+        if self.allowed_states is not None:
+            if result not in self.allowed_states:
+                raise InvalidResultState(
+                    '{} is not in list of allowed states\n{}'.format(
+                        result, self.allowed_states))
+        return result
+
+
+class GET_STATE(State):
+    def __init__(self, func, states=None):
+        self.func = func
+        self.allowed_states = states
+
+    def get_state(self, model, transition, result, args=[], kwargs={}):
+        result_state = self.func(model, *args, **kwargs)
+        if self.allowed_states is not None:
+            if result_state not in self.allowed_states:
+                raise InvalidResultState(
+                    '{} is not in list of allowed states\n{}'.format(
+                        result, self.allowed_states))
+        return result_state
